@@ -22,17 +22,24 @@ package org.apache.iceberg.spark.actions;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.StaticTableOperations;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.actions.BaseExpireSnapshotsActionResult;
 import org.apache.iceberg.actions.ExpireSnapshots;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -143,6 +150,29 @@ public class BaseExpireSnapshotsSparkAction
   }
 
   /**
+   * Compute the dataset of files no longer referenced but do not commit them.
+   * This method is useful for testing and validation of snapshots that'd be expired.
+   *
+   * @return a potential Dataset of files that are no longer referenced by the table.
+   */
+  public Dataset<Row> apply() {
+    if (expiredFiles != null) {
+      return expiredFiles;
+    }
+
+    TableMetadata baseMetadata = ops.current();
+    Dataset<Row> originalFiles = buildValidFileDF(baseMetadata);
+    List<Snapshot> removedSnapshots = expireSnapshots().apply();
+    TableMetadata updatedMetadata = baseMetadata.removeSnapshotsIf(removedSnapshots::contains);
+
+    // Write to a temporary metadata location which is used to
+    // build a reachable set of files in a distributed manner.
+    String metadataLocation = writeTempMetadata(table.io(), updatedMetadata, -1 /*replace with some random version*/);
+    StaticTableOperations staticTable = new StaticTableOperations(metadataLocation, table.io());
+    return originalFiles.except(buildValidFileDF(staticTable.current()));
+  }
+
+  /**
    * Expires snapshots and commits the changes to the table, returning a Dataset of files to delete.
    * <p>
    * This does not delete data files. To delete data files, run {@link #execute()}.
@@ -153,33 +183,40 @@ public class BaseExpireSnapshotsSparkAction
    */
   public Dataset<Row> expire() {
     if (expiredFiles == null) {
-      // fetch metadata before expiration
-      Dataset<Row> originalFiles = buildValidFileDF(ops.current());
+      if (expiredFiles == null) {
+        // Metadata before Expiration
+        Dataset<Row> originalFiles = buildValidFileDF(ops.current());
 
-      // perform expiration
-      org.apache.iceberg.ExpireSnapshots expireSnapshots = table.expireSnapshots().cleanExpiredFiles(false);
-      for (long id : expiredSnapshotIds) {
-        expireSnapshots = expireSnapshots.expireSnapshotId(id);
+        // Perform Expiration
+        expireSnapshots().commit();
+
+        // Metadata after Expiration
+        Dataset<Row> validFiles = buildValidFileDF(ops.refresh());
+
+        this.expiredFiles = originalFiles.except(validFiles);
       }
 
-      if (expireOlderThanValue != null) {
-        expireSnapshots = expireSnapshots.expireOlderThan(expireOlderThanValue);
-      }
-
-      if (retainLastValue != null) {
-        expireSnapshots = expireSnapshots.retainLast(retainLastValue);
-      }
-
-      expireSnapshots.commit();
-
-      // fetch metadata after expiration
-      Dataset<Row> validFiles = buildValidFileDF(ops.refresh());
-
-      // determine expired files
-      this.expiredFiles = originalFiles.except(validFiles);
+      return expiredFiles;
     }
 
     return expiredFiles;
+  }
+
+  private org.apache.iceberg.ExpireSnapshots expireSnapshots() {
+    org.apache.iceberg.ExpireSnapshots expireSnapshots = table.expireSnapshots().cleanExpiredFiles(false);
+    for (long id : expiredSnapshotIds) {
+      expireSnapshots = expireSnapshots.expireSnapshotId(id);
+    }
+
+    if (expireOlderThanValue != null) {
+      expireSnapshots = expireSnapshots.expireOlderThan(expireOlderThanValue);
+    }
+
+    if (retainLastValue != null) {
+      expireSnapshots = expireSnapshots.retainLast(retainLastValue);
+    }
+
+    return expireSnapshots;
   }
 
   @Override
@@ -229,6 +266,36 @@ public class BaseExpireSnapshotsSparkAction
     return appendTypeString(buildValidDataFileDF(staticTable), DATA_FILE)
         .union(appendTypeString(buildManifestFileDF(staticTable), MANIFEST))
         .union(appendTypeString(buildManifestListDF(staticTable), MANIFEST_LIST));
+  }
+
+  private String writeTempMetadata(FileIO io, TableMetadata metadata, int newVersion) {
+    String newTableMetadataFilePath = newTableMetadataFilePath(metadata, newVersion);
+    OutputFile newMetadataLocation = io.newOutputFile(newTableMetadataFilePath);
+
+    // write the new metadata
+    // use overwrite to avoid negative caching in S3. this is safe because the metadata location is
+    // always unique because it includes a UUID.
+    TableMetadataParser.overwrite(metadata, newMetadataLocation);
+
+    return newMetadataLocation.location();
+  }
+
+  private String newTableMetadataFilePath(TableMetadata meta, int newVersion) {
+    String codecName = meta.property(
+        TableProperties.METADATA_COMPRESSION, TableProperties.METADATA_COMPRESSION_DEFAULT);
+    String fileExtension = TableMetadataParser.getFileExtension(codecName);
+    return metadataFileLocation(meta, String.format("%05d-%s%s", newVersion, UUID.randomUUID(), fileExtension));
+  }
+
+  private String metadataFileLocation(TableMetadata metadata, String filename) {
+    String metadataLocation = metadata.properties()
+        .get(TableProperties.WRITE_METADATA_LOCATION);
+
+    if (metadataLocation != null) {
+      return String.format("%s/%s", metadataLocation, filename);
+    } else {
+      return String.format("%s/%s/%s", metadata.location(), "metadata", filename);
+    }
   }
 
   /**

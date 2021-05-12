@@ -986,6 +986,15 @@ public abstract class TestExpireSnapshotsAction extends SparkTestBase {
 
   @Test
   public void testExpireAction() {
+    testExpireOrApplyAction(false);
+  }
+
+  @Test
+  public void testApplyAction() {
+    testExpireOrApplyAction(true);
+  }
+
+  private void testExpireOrApplyAction(boolean applyOnly)  {
     table.newAppend()
         .appendFile(FILE_A)
         .commit();
@@ -1007,12 +1016,22 @@ public abstract class TestExpireSnapshotsAction extends SparkTestBase {
     ExpireSnapshotsAction action = Actions.forTable(table).expireSnapshots()
         .expireOlderThan(tAfterCommits)
         .deleteWith(deletedFiles::add);
-    Dataset<Row> pendingDeletes = action.expire();
 
-    List<Row> pending = pendingDeletes.collectAsList();
+    Dataset<Row> pendingDeletes;
+    List<Row> pending;
+    if (applyOnly){
+      pendingDeletes = action.apply();
+
+      Assert.assertNotNull("Should not remove the oldest snapshot", table.snapshot(firstSnapshot.snapshotId()));
+    } else {
+      pendingDeletes = action.expire();
+
+      Assert.assertNull("Should remove the oldest snapshot", table.snapshot(firstSnapshot.snapshotId()));
+    }
+
+    pending = pendingDeletes.collectAsList();
 
     Assert.assertEquals("Should not change current snapshot", snapshotId, table.currentSnapshot().snapshotId());
-    Assert.assertNull("Should remove the oldest snapshot", table.snapshot(firstSnapshot.snapshotId()));
 
     Assert.assertEquals("Pending deletes should contain one row", 1, pending.size());
     Assert.assertEquals("Pending delete should be the expired manifest list location",
